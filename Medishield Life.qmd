@@ -1,0 +1,359 @@
+---
+title: "Stress-Testing the Safety Net: Simulating Out-of-Pocket Healthcare Risks in Singapore"
+subtitle: "Where do MediShield Life and MediSave limits leave subsidized patients exposed to financial shock?"
+author: "Tan Wee Teck"
+date: today
+format: 
+  html:
+    theme: flatly
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    toc-title: "Contents"
+    number-sections: true
+    code-fold: true
+    code-tools: true
+execute:
+  warning: false
+  message: false
+---
+
+# Executive Summary
+
+Singapore’s "3M" healthcare financing framework is designed to protect subsidized patients from overwhelming medical debt. However, fixed MediShield Life and MediSave claim limits may leave certain patients exposed to severe tail-end financial risks. To quantify this exposure, I built a Monte Carlo simulation using historical Ministry of Health (MOH) bill sizes and Average Length of Stay (alos) data to test 10,000 simulated patient bills per surgical procedure against national insurance and savings limits.
+
+**Key Findings:**
+
+-   **The Safety Net Works for Most:** Subsidized day surgeries are overwhelmingly safe, with 99.4% of procedures carrying virtually no risk of severe out-of-pocket costs.
+
+-   **Systemic Gaps in Inpatient Wards:** Approximately **13% of all surgical procedures** performed in Ward B2 and Ward C carry a clinically significant probability (\>5%) of leaving the patient with an out-of-pocket cash shock exceeding \$14,500.
+
+-   **Highly Concentrated Danger Zones:** The financial risk is not evenly distributed. Patients undergoing complex cardiovascular procedures (e.g., Aortic/Mitral Valve Lesions) and major orthopaedic procedures (e.g., Spine Deformities) face a near-100% probability of a massive cash shortfall, indicating that current TOSP and MediSave limits for these specific codes are insufficient to cover standard complication variances.
+
+# Policy Context & Objective
+
+Singapore’s healthcare financing relies on the "3M" framework: MediFund, MediSave, and MediShield Life. For patients in heavily subsidized wards (Class B2 and C), this safety net is designed to keep out-of-pocket cash payments manageable.
+
+However, MediShield Life and MediSave are subject to strict claim limits based on the complexity of the surgical procedure based on the Table of Surgical Procedures (TOSP). This project aims to answer a critical question: **Where do these claim limits fail to cover the tail-end risks of large hospital bills, leaving lower-income patients exposed to financial shock?**
+
+# Methodology: Simulating Financial Risk
+
+## Data Source and Scope
+
+I utilized historical bill size data and Average Length of Stay (ALOS) metrics published by the Ministry of Health (Ministry of Health \[MOH\], 2025). Since medishield life only offers full coverage for subsidized day surgeries, ward C and B2 (Central Provident Fund \[CPF\], n.d.), and the pro-ration factor drops quite sharply for wards B1 and above, it is assumed that those who only have medishield life would only opt for these options as staying in other wards would become prohibitively expensive. Hence, the data was scoped strictly to **Ward C, Ward B2, and Subsidized Day Surgeries**.
+
+The financial risk would be modelled using the P25, P50, and P75 bill data, which represents the 25th, and 50th, and 75th percentile of total hospital bill per surgical procedure per hospital. Healthcare costs will be modeled by a log-normal distribution based on these 3 values for every hospital bill and surgical procedure. The log-normal distribution is the most suitable since costs cannot go below 0 and there tends to be tail end risk of large hospital bills due to complications. This assumption of the underlying distribution is also supported by research (French & Jones, 2004).
+
+------------------------------------------------------------------------
+
+```{r}
+#| label: load-data
+library(tidyverse)
+library(plotly)
+library(readxl)
+library(janitor)
+
+set.seed(2026)
+medishield <- read_excel("data/2023hospitalbillsizes.xlsx", sheet = 3, skip = 4)
+
+#filtering for Public Hospitals/Centres (Subsidised) would only keep the data for Day Surgeries, Ward C and B2. Data formats for p25, p50, and p75 bills and ALOS are already correct, and no na values are present.
+medishield_clean <- medishield %>%
+  filter(Setting == "Public Hospitals/ Centres (Subsidised)") %>%
+  clean_names()
+
+```
+
+## Defining the Policy Constraints
+
+After accounting for the distribution of total hospital bills, the final amount payable would be calculated based on the
+
+1.  **Deductibles:** Applied based on ward class.
+
+2.  **Tiered Co-insurance:** Ranging from 10% to 3% based on the claimable amount.
+
+3.  **Claim Limits:** Hard caps applied via the revised Jan 2020 TOSP limits for MediShield Life, and the surgical limits for MediSave.
+
+Since the data on hospital bills is from 2023, the claim limits are based on the 2020 instead of the 2025 version (Medishield Life Council, 2024) (Central Provident Fund, 2021).
+
+```{r}
+#| label: policy-lookups
+
+# TOSP Insurance Limits (Jan 2020)
+tosp_limit_lookup <- tribble(
+  ~Table_Num, ~A,    ~B,    ~C,
+  "1",        240,   340,   340,
+  "2",        580,   760,   760,
+  "3",        1060,  1160,  1280,
+  "4",        1540,  1580,  1640,
+  "5",        1800,  2180,  2180,
+  "6",        2360,  2360,  2360,
+  "7",        2600,  2600,  2600
+)
+
+# MediSave Surgical Limits
+medisave_limit_lookup <- tribble(
+  ~Table_Num, ~A,    ~B,    ~C,
+  "1",        250,   350,   450,
+  "2",        600,   750,   950,
+  "3",        1250,  1550,  1850,
+  "4",        2150,  2600,  2850,
+  "5",        3150,  3550,  3950,
+  "6",        4650,  5150,  5650,
+  "7",        6200,  6900,  7550
+)
+
+# Helper to fetch limits
+get_limit <- function(tosp_code, lookup_table) {
+  num <- str_sub(tosp_code, 1, 1)
+  let <- str_sub(tosp_code, 2, 2)
+  row_data <- lookup_table %>% filter(Table_Num == num)
+  if(nrow(row_data) == 0) return(NA_real_)
+  if (let == "A") return(row_data$A)
+  if (let == "B") return(row_data$B)
+  if (let == "C") return(row_data$C)
+  return(NA_real_)
+}
+
+# Tiered Co-insurance Logic
+calculate_coinsurance <- function(claimable_amount) {
+  tier1 <- pmin(claimable_amount, 5000) * 0.10
+  rem1 <- pmax(claimable_amount - 5000, 0)
+  tier2 <- pmin(rem1, 5000) * 0.05
+  rem2 <- pmax(rem1 - 5000, 0)
+  tier3 <- rem2 * 0.03
+  return(tier1 + tier2 + tier3)
+}
+
+```
+
+## The Monte Carlo Simulation
+
+Because the policy rules (deductibles and hard limits) break the standard distribution curve of healthcare costs, I built a Monte Carlo simulation.
+
+For every surgical procedure, an optimization function (`optim`) finds the exact Log-Normal distribution that matches the MOH's P25, P50, and P75 bill sizes. Then, the model generates 10,000 simulated patient bills. As we only know the total hospital bill but there are different claim limits for the ward and treatment fees, and the surgical fee, We split these bills into "Ward" and "Surgery" components using the specific average length of stay (`alos` )to accurately test them against the national claim limits. The ward fees varies for each hospital, varying from the range of \$40 to \$70 depending on the type of ward (Fung, 2023). However, that excludes treatment fees which are highly variable as well, but also included in the claim limits. An estimate has to be made for the ward component of fees claimable, with day surgery fees set at \$100, ward C fees set at \$200, and ward B2 fees set at \$300 per day. Using these daily fees multiplied by the ALOS gives me the ward component, which then allows me to isolate the surgery component.
+
+The final payout by the patient is calculated after accounting for the claim limits, deductibles, and co-payments, and then simulated 10000 times for a Monte Carlo simulation.
+
+```{r}
+#| label: build-simulator
+
+# 1. Curve Fitter
+get_log_params <- function(p25, p50, p75) {
+  if (is.na(p25) || is.na(p50) || is.na(p75)) return(tibble(fit_mean=NA, fit_sd=NA))
+  tryCatch({
+    err_fn <- function(p, t25, t50, t75) {
+      sum((qlnorm(c(0.25, 0.50, 0.75), p[1], p[2]) - c(t25, t50, t75))^2)
+    }
+    res <- optim(c(log(p50), 0.5), err_fn, t25=p25, t50=p50, t75=p75, 
+                 method="L-BFGS-B", lower=c(-Inf, 0.001))
+    return(tibble(fit_mean = res$par[1], fit_sd = res$par[2]))
+  }, error = function(e) return(tibble(fit_mean=NA, fit_sd=NA)))
+}
+
+# 2. Risk Simulator
+calculate_cash_risk_alos <- function(mu, sigma, ward_type, table_limit, alos, medisave_limit, threshold = 1000) {
+  if (is.na(mu) || is.na(sigma) || is.na(table_limit) || is.na(medisave_limit)) return(NA_real_)
+  
+  # Set Ward Parameters
+  if (ward_type == "Ward C") { ded <- 2000; rate <- 200 } 
+  else if (ward_type == "Ward B2") { ded <- 2500; rate <- 300 } 
+  else { ded <- 1500; rate <- 100 }
+  
+  # Simulate 10k Bills and Split Components
+  bills <- rlnorm(10000, meanlog = mu, sdlog = sigma)
+  ward_cost <- pmin(bills, alos * rate)
+  surg_cost <- bills - ward_cost
+  
+  # Apply Insurance Limits & Payout
+  claim_surg <- pmin(surg_cost, table_limit)
+  claim_ward <- pmin(ward_cost, 800 * max(1, alos))
+  claim_base <- pmax((claim_surg + claim_ward) - ded, 0)
+  
+  payout <- claim_base - calculate_coinsurance(claim_base)
+  bill_to_patient <- bills - payout
+  
+  # Apply MediSave & Calculate Cash Shock
+  cash_outlay <- bill_to_patient - pmin(bill_to_patient, medisave_limit)
+  return(mean(cash_outlay > threshold))
+}
+```
+
+# Findings
+
+By running the simulation across the dataset, we can identify which surgeries carry the highest probability of a "Cash Shock", defined here as an out-of-pocket payment exceeding \$14,500 after all subsidies, insurance, and MediSave have been exhausted. The amount has been set at \$14,500 based on 50% of the wealth in liquid assets of the bottom 20% of Singapore Citizens (Ministry of Finance, 2026).
+
+```{r}
+#| label: execute-model
+#| results: hide
+
+# Pre-calculate Limits and Fit Curves
+medishield_clean <- medishield_clean %>%
+  rowwise() %>%
+  mutate(
+    ins_limit = get_limit(tosp_table_number, tosp_limit_lookup),
+    msv_limit = get_limit(tosp_table_number, medisave_limit_lookup)
+  ) %>%
+  ungroup() %>%
+  mutate(params = pmap(list(p25_bill, p50_bill, p75_bill), get_log_params)) %>%
+  unnest_wider(params)
+
+# Calculate Risk (Runs 10k simulations per row)
+final_results <- medishield_clean %>%
+  rowwise() %>%
+  mutate(
+    Prob_Cash_Shock = calculate_cash_risk_alos(fit_mean, fit_sd, ward_type, ins_limit, alos, msv_limit, 14500)
+  ) %>%
+  ungroup()
+```
+
+## The Risk Landscape
+
+The interactive scatterplot below illustrates the relationship between the median bill size and the probability of a cash shock. The data is filtered only for probability of a cash shock that exceeds 0.05.
+
+*(Hover over the data points to view the specific surgical procedure and its risk profile).*
+
+```{r}
+#| label: scatterplot
+#| out-width: "100%"
+
+plot_data <- final_results %>%
+  # Keep only surgeries with a greater than 5% chance of cash shock
+  filter(Prob_Cash_Shock > 0.05) %>% 
+  mutate(
+    Label = paste0(
+      "<b>", str_wrap(tosp_description, 40), "</b><br>",
+      "Ward: ", ward_type, "<br>",
+      "Median Bill: $", scales::comma(p50_bill, accuracy = 0.01), "<br>",
+      "Risk: ", scales::percent(Prob_Cash_Shock, 0.1)
+    )
+  )
+
+p <- ggplot(plot_data, aes(x = p50_bill, y = Prob_Cash_Shock, color = ward_type, text = Label)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_x_continuous(labels = scales::dollar_format()) +
+  scale_color_viridis_d(option = "turbo") +
+  labs(x = "Median Bill Size ($)", y = "Probability of Cash Shock (> $14,500)", color = "Ward") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggplotly(p, tooltip = "text")
+```
+
+## Top 20 Riskiest Surgeries
+
+The chart below ranks the absolute highest-risk surgeries based on our simulation. Surprisingly, it is Ward C that takes up the majority of observations where the cash shock risk is the highest. The top 3 surgeries have a cash shock risk of over 90%, showing that there is an almost guaranteed chance of a catastrophic bill.
+
+```{r}
+#| label: lollipop-chart
+#| fig-height: 8
+
+top_risks <- final_results %>%
+  arrange(desc(Prob_Cash_Shock)) %>%
+  head(20) %>%
+  mutate(
+tosp_description = fct_reorder(paste0("[", tosp_code, "] ", str_trunc(tosp_description, 40), " (", hospital, " - ", ward_type, ")"), Prob_Cash_Shock)
+  )
+
+ggplot(top_risks, aes(x = Prob_Cash_Shock, y = tosp_description, color = ward_type)) +
+  geom_segment(aes(x = 0, xend = Prob_Cash_Shock, y = tosp_description, yend = tosp_description), color = "gray") +
+  geom_point(size = 4) +
+  scale_x_continuous(labels = scales::percent_format()) +
+  scale_color_viridis_d(option = "turbo") +
+  labs(x = "Probability of Shock (> $14,500 cash)", y = NULL) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 9), panel.grid.major.y = element_blank(), legend.position = "bottom")
+```
+
+## Proportion of Cash Shock Risk \>5% by Ward Type
+
+Looking at the total proportion of surgery procedures by cash shock risk, while the top 20 procedures were dominated by Ward C stays, the overall proportion is still slightly higher for Ward B2 at 13.2% vs 12.6%. The proportion for day surgeries is almost 0 at 0.6%.
+
+```{r}
+#| label: risk-proportion-bar
+#| fig-height: 5
+
+# 1. Prepare the summary data
+risk_summary <- final_results %>%
+  # Categorize each procedure as High Risk or Safe based on the 5% cutoff
+  mutate(Risk_Category = ifelse(Prob_Cash_Shock > 0.05, "High Risk (> 5% Shock)", "Safe (<= 5% Shock)")) %>%
+  # Group by ward and the new risk category to count them
+  group_by(ward_type, Risk_Category) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  # Calculate the percentage within each ward
+  group_by(ward_type) %>%
+  mutate(Proportion = Count / sum(Count)) %>%
+  ungroup() %>%
+  # Reorder the factor so "High Risk" sits at the bottom/top consistently
+  mutate(Risk_Category = factor(Risk_Category, levels = c("High Risk (> 5% Shock)", "Safe (<= 5% Shock)")))
+
+# 2. Build the Stacked Bar Chart
+ggplot(risk_summary, aes(x = ward_type, y = Proportion, fill = Risk_Category)) +
+  # position = "fill" stretches the bars to 100%
+  geom_col(position = "fill", width = 0.6) + 
+  # Add the exact percentage text directly onto the bars
+  geom_text(aes(label = scales::percent(Proportion, accuracy = 0.1)), 
+            position = position_stack(vjust = 0.5), 
+            color = "white", fontface = "bold", size = 4) +
+  # Use stark, intuitive colors (Red = Danger, Blue/Teal = Safe)
+  scale_fill_manual(values = c("High Risk (> 5% Shock)" = "#d95f02", "Safe (<= 5% Shock)" = "#1b9e77")) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    x = NULL, # Hide X axis label since "Ward C" is self-explanatory
+    y = "Proportion of Surgical Procedures",
+    fill = "Risk Level"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    panel.grid.major.x = element_blank(), # Clean up vertical grid lines
+    axis.text.x = element_text(size = 11, face = "bold")
+  )
+
+```
+
+# Limitations & Assumptions
+
+**Static Ward Cost**
+
+The model assumes a fixed daily ward cost based on averages (\$200 for C, \$300 for B2). In reality, ward charges fluctuate based on individual consumables used. For patients with more severe complications it is likely that the ward and treatment costs are higher than estimated, which also means that a bigger proportion of the hopsital bill could be claimed up to the limit of \$800 per day (based on the 2020 revision), causing an overestimate of the out of pocket costs. This analysis also doesn't consider ICU ward costs for cases with severe complications, which would also result in higher claim limits.
+
+**Full MediSave Utilization**
+
+The model assumes the patient has a sufficient MediSave balance to cover up to the surgical limit. Patients with depleted MediSave accounts would face significantly higher cash shocks.
+
+**Distribution Shape**
+
+While healthcare costs closely follow a Log-Normal distribution, extreme outliers (e.g., prolonged ICU stays following complications) might be slightly underrepresented depending on how the P75 bounds scale.
+
+**Medifund**
+
+The cash shock may be funded by Medifund, but since it is approved on a case by case basis, it would not be possible to analyse what is the final out of pocket costs for patients.
+
+# Conclusion
+
+This simulation demonstrates that while the MediShield Life and MediSave framework functions exactly as intended for routine and low-complexity procedures, the rigid nature of the Table of Surgical Procedures (TOSP) limits fails to adequately protect patients requiring highly complex, multi-day interventions. When a subsidized patient in Ward C faces a near-100% probability of a \$14,500+ cash bill for a heart valve procedure, the safety net has fundamentally bottomed out.
+
+This data-driven approach offers two immediate applications for public healthcare administration:
+
+1.  **Targeted Policy Reviews (MOH):** Policymakers do not need to enact blanket increases to all MediShield Life claim limits, which would needlessly drive up national premiums. Instead, MOH can use this risk simulator to precisely target the \~13% of inpatient procedures, specifically in cardiology and spinal orthopaedics, that urgently require an upward revision of their specific TOSP or MediSave limits.
+
+2.  **Proactive Financial Intervention (MSF & Public Hospitals):** Currently, Medical Social Workers (MSWs) often step in after a massive bill has already been generated. By utilizing this predictive risk model, hospitals can proactively flag patients scheduled for the high-risk surgeries. These patients can be routed for immediate financial counseling or pre-emptive MediFund assessment before they ever enter the operating theatre, significantly reducing patient anxiety and hospital bad-debt ratios.
+
+Ultimately, mapping financial risk at the procedure-level transforms a reactive healthcare financing system into a proactive one, ensuring that the lower income remains truly protected against catastrophic medical costs.
+
+# Bibliography
+
+Central Provident Fund. (n.d.). *CPFB \| MediShield Life pro-ration factor*. Www.cpf.gov.sg; Central Provident Fund. Retrieved February 21, 2026, from https://www.cpf.gov.sg/member/healthcare-financing/medishield-life/medishield-life-proration
+
+Central Provident Fund. (2021, March 1). *Medisave withdrawal limits*. Central Provident Fund; Central Provident Fund. https://www.cpf.gov.sg/content/dam/web/member/healthcare/documents/MediSave%20Withdrawal%20Limits_1%20March%202021.pdf
+
+French, E., & Jones, J. B. (2004). On the distribution and dynamics of health care costs. *Journal of Applied Econometrics*, *19*(6), 705–721. https://doi.org/10.1002/jae.790
+
+Fung, S. (2023, August 18). *Public vs. Private: What to Expect from a Singapore Hospital Ward*. Pacific Prime Singapore’s Blog. https://www.pacificprime.sg/blog/public-vs-private-hospital-ward-in-singapore/
+
+Medishield Life Council. (2024). MediShield Life 2024 Review Council Report. In *MediShield Life Reviews*. MediShield Life Council. https://isomer-user-content.by.gov.sg/3/c33f49bb-869d-4ff0-88ef-755e9602402d/medishieldlife-report-2024.pdf
+
+Ministry of Finance. (2026). Occasional paper on income growth, inequality, and social mobility trends in Singapore. In *Ministry of Finance*. Ministry of Finance. https://isomer-user-content.by.gov.sg/153/d5ff0cb3-61ca-4a14-bb46-0060041c5f12/1a%20Occasional%20Paper%20on%20Income%20Growth%20Inequality%20and%20Social%20Mobility%20Trends%20in%20Singapore%20(MOF).pdf
+
+MOH. (2025, August 15). *Hospital bills and fee benchmarks*. Ministry of Health; Ministry of Health. https://www.moh.gov.sg/managing-expenses/bills-and-fee-benchmarks/hospital-bills-and-fee-benchmarks/
